@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Arm Config Editor</title>
+<style>
+body { font-family: system-ui, Arial, sans-serif; margin: 20px; }
+h1 { margin-bottom: 10px; }
+h2 { margin-top: 20px; }
+table { border-collapse: collapse; width: 100%; max-width: 1100px; }
+th, td { border: 1px solid #ddd; padding: 8px; }
+th { background: #f5f5f5; }
+input[type="number"] { width: 120px; }
+input[type="text"] { width: 100%; }
+button { padding: 10px 14px; margin-top: 15px; cursor: pointer; }
+.ok { color: green; }
+.err { color: red; }
+.warn { color: #b8860b; }
+
+/* Toggle switch styles */
+.toggle-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 80px;
+  height: 28px;
+  flex-shrink: 0;
+}
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: #4a90d9;
+  border-radius: 28px;
+  transition: background 0.25s;
+}
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  height: 22px;
+  width: 22px;
+  left: 3px;
+  top: 3px;
+  background: white;
+  border-radius: 50%;
+  transition: transform 0.25s;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+}
+.toggle-switch input:checked + .toggle-slider {
+  background: #e07b30;
+}
+.toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(52px);
+}
+.toggle-label {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: #555;
+  min-width: 60px;
+}
+</style>
+</head>
+<body>
+
+<p><a href="../index.html">&larr; Back</a></p>
+
+<h2>Load Existing Config</h2>
+<div style="margin-bottom:15px;">
+  <input type="file" id="loadConfigFile" accept="application/json,.json">
+  <button id="loadBtn">Load Config</button>
+</div>
+
+
+<h1>Arm Configuration Editor</h1>
+
+<h2>X3D Model File Paths</h2>
+<table id="modelTable">
+<thead>
+<tr><th>Part</th><th>X3D File Path</th></tr>
+</thead>
+<tbody></tbody>
+</table>
+
+<h2>Translations</h2>
+<table id="translationsTable">
+<thead>
+<tr><th>Transform</th><th>X</th><th>Y</th><th>Z</th></tr>
+</thead>
+<tbody></tbody>
+</table>
+
+<h2>Joint Movement</h2>
+<table id="axesTable">
+  <thead>
+    <tr><th>Joint</th><th>Axis X</th><th>Axis Y</th><th>Axis Z</th><th>Type</th></tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+
+<h2>Joint Limits (deg)</h2>
+<table id="limitsTable">
+<thead>
+<tr><th>Joint</th><th>Min</th><th>Max</th></tr>
+</thead>
+<tbody></tbody>
+</table>
+
+<h2>Output File Settings</h2>
+<table>
+  <thead>
+    <tr><th>Setting</th><th>Value</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Output File Name</td>
+      <td>
+        <input type="text" id="outputFileName" value="arm_config.json">
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<button id="saveBtn">Save (Download JSON)</button>
+<button id="resetBtn">Reset Defaults</button>
+
+<p id="status"></p>
+
+<script>
+
+// Fixed sets of keys the UI is built around — independent of where the
+// config values themselves come from, so the table structure never has
+// to wait on an async fetch to know its own shape.
+const PARTS = [
+  "BaseTransform","Joint1","Joint2","Joint3","Joint4","Joint5","Joint6","Ik_bone"
+];
+const JOINTS = ["j1","j2","j3","j4","j5","j6"];
+const AXIS_KEYS = ["BaseTransform","Joint1","Joint2","Joint3","Joint4","Joint5","Joint6"];
+
+// Used only if config/default_config.json can't be reached (e.g. opened via
+// file:// instead of through bridge_server.py). The real defaults always
+// come from that one shared file — this is a safety net, not a second
+// source of truth.
+const FALLBACK_CONFIG = {
+  schema_version: 1,
+  model_paths: {
+    BaseTransform: "./models/base.x3d", Joint1: "./models/joint1.x3d",
+    Joint2: "./models/joint2.x3d", Joint3: "./models/joint3.x3d",
+    Joint4: "./models/joint4.x3d", Joint5: "./models/joint5.x3d",
+    Joint6: "./models/joint6.x3d", Ik_bone: "./models/tool.x3d"
+  },
+  translations_mm: {
+    BaseTransform: [0,0,0], Joint1: [175,0,20], Joint2: [187,0,138],
+    Joint3: [0,0,290], Joint4: [0,0,280], Joint5: [0,0,0],
+    Joint6: [0,0,0], Ik_bone: [0,0,115]
+  },
+  joint_limits_deg: {
+    j1: [-170,170], j2: [-120,120], j3: [-200,70],
+    j4: [-300,300], j5: [-130,130], j6: [-360,360]
+  },
+  joint_axes: {
+    BaseTransform: [0,0,1], Joint1: [0,0,1], Joint2: [0,1,0],
+    Joint3: [0,1,0], Joint4: [1,0,0], Joint5: [0,1,0], Joint6: [1,0,0]
+  },
+  joint_type: {
+    BaseTransform: "rotate", Joint1: "rotate", Joint2: "rotate",
+    Joint3: "rotate", Joint4: "rotate", Joint5: "rotate", Joint6: "rotate"
+  }
+};
+
+// Populated once loadDefaultConfig() resolves — every function below reads
+// this rather than a hardcoded literal.
+let DEFAULT_CONFIG = null;
+
+function render(config) {
+
+  // MODEL PATHS
+  const mBody = document.querySelector("#modelTable tbody");
+  mBody.innerHTML = "";
+  PARTS.forEach(part => {
+    const tr = document.createElement("tr");
+
+    const tdName = document.createElement("td");
+    tdName.textContent = part;
+
+    const tdInput = document.createElement("td");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = config.model_paths[part];
+    tdInput.appendChild(input);
+
+    tr.appendChild(tdName);
+    tr.appendChild(tdInput);
+    mBody.appendChild(tr);
+  });
+
+  // TRANSLATIONS
+  const tBody = document.querySelector("#translationsTable tbody");
+  tBody.innerHTML = "";
+  PARTS.forEach(part => {
+    const tr = document.createElement("tr");
+    const [x,y,z] = config.translations_mm[part];
+
+    tr.innerHTML = `
+      <td>${part}</td>
+      <td><input type="number" value="${x}" step="any"></td>
+      <td><input type="number" value="${y}" step="any"></td>
+      <td><input type="number" value="${z}" step="any"></td>
+    `;
+    tBody.appendChild(tr);
+  });
+
+  // JOINT MOVEMENT (axes + type)
+  const aBody = document.querySelector("#axesTable tbody");
+  aBody.innerHTML = "";
+  AXIS_KEYS.forEach(name => {
+    const [ax, ay, az] = (config.joint_axes && config.joint_axes[name]) ? config.joint_axes[name] : [0,0,1];
+    const isTranslate = (config.joint_type && config.joint_type[name]) === "translate";
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${name}</td>
+      <td><input type="number" value="${ax}" step="any"></td>
+      <td><input type="number" value="${ay}" step="any"></td>
+      <td><input type="number" value="${az}" step="any"></td>
+      <td>
+        <div class="toggle-wrap">
+          <label class="toggle-switch">
+            <input type="checkbox" ${isTranslate ? "checked" : ""}>
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="toggle-label">${isTranslate ? "Translate" : "Rotate"}</span>
+        </div>
+      </td>
+    `;
+
+    // Update label text live when toggled
+    const checkbox = tr.querySelector("input[type=checkbox]");
+    const label = tr.querySelector(".toggle-label");
+    checkbox.addEventListener("change", () => {
+      label.textContent = checkbox.checked ? "Translate" : "Rotate";
+    });
+
+    aBody.appendChild(tr);
+  });
+
+
+  // LIMITS
+  const lBody = document.querySelector("#limitsTable tbody");
+  lBody.innerHTML = "";
+  JOINTS.forEach(j => {
+    const [min,max] = config.joint_limits_deg[j];
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${j}</td>
+      <td><input type="number" value="${min}" step="any"></td>
+      <td><input type="number" value="${max}" step="any"></td>
+    `;
+    lBody.appendChild(tr);
+  });
+}
+
+function readConfig() {
+  const config = structuredClone(DEFAULT_CONFIG);
+
+  // Model paths
+  document.querySelectorAll("#modelTable tbody tr").forEach((row,i)=>{
+    const part = PARTS[i];
+    config.model_paths[part] = row.querySelector("input").value.trim();
+  });
+
+  // Translations
+  document.querySelectorAll("#translationsTable tbody tr").forEach((row,i)=>{
+    const part = PARTS[i];
+    const inputs = row.querySelectorAll("input");
+    config.translations_mm[part] = [
+      Number(inputs[0].value),
+      Number(inputs[1].value),
+      Number(inputs[2].value)
+    ];
+  });
+
+  // Joint movement (axes + type)
+  config.joint_axes = {};
+  config.joint_type = {};
+  document.querySelectorAll("#axesTable tbody tr").forEach((row, i) => {
+    const name = AXIS_KEYS[i];
+    const numInputs = row.querySelectorAll("input[type=number]");
+    const checkbox = row.querySelector("input[type=checkbox]");
+    config.joint_axes[name] = [
+      Number(numInputs[0].value),
+      Number(numInputs[1].value),
+      Number(numInputs[2].value)
+    ];
+    config.joint_type[name] = checkbox.checked ? "translate" : "rotate";
+  });
+
+  // Limits
+  document.querySelectorAll("#limitsTable tbody tr").forEach((row,i)=>{
+    const joint = JOINTS[i];
+    const inputs = row.querySelectorAll("input");
+    config.joint_limits_deg[joint] = [
+      Number(inputs[0].value),
+      Number(inputs[1].value)
+    ];
+  });
+
+  return config;
+}
+
+function sanitizeFileName(name) {
+  name = name.trim();
+
+  if (!name) {
+    name = "arm_config";
+  }
+
+  // Remove illegal filename characters
+  name = name.replace(/[<>:"/\\|?*]+/g, "");
+
+  // Ensure .json extension
+  if (!name.toLowerCase().endsWith(".json")) {
+    name += ".json";
+  }
+
+  return name;
+}
+
+function downloadJSON(config) {
+  const fileNameInput = document.getElementById("outputFileName").value;
+  const finalName = sanitizeFileName(fileNameInput);
+
+  const blob = new Blob([JSON.stringify(config, null, 2)], {
+    type: "application/json"
+  });
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+
+  a.href = url;
+  a.download = finalName;
+  a.click();
+
+  URL.revokeObjectURL(url);
+
+  document.getElementById("status").innerHTML =
+    "<span class='ok'>Downloaded " + finalName + "</span>";
+}
+
+
+document.getElementById("saveBtn").addEventListener("click",()=>{
+  const cfg = readConfig();
+  downloadJSON(cfg);
+});
+
+document.getElementById("resetBtn").addEventListener("click",()=>{
+  render(structuredClone(DEFAULT_CONFIG));
+});
+
+// ==========================
+// LOAD DEFAULT CONFIG (shared file — single source of truth)
+// ==========================
+
+async function loadDefaultConfig() {
+  const statusEl = document.getElementById("status");
+  try {
+    const res = await fetch("../../config/default_config.json");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    DEFAULT_CONFIG = await res.json();
+  } catch (err) {
+    console.warn("Could not load config/default_config.json, using built-in fallback:", err.message);
+    DEFAULT_CONFIG = structuredClone(FALLBACK_CONFIG);
+    statusEl.innerHTML =
+      "<span class='warn'>Could not reach config/default_config.json — using built-in fallback defaults. " +
+      "Make sure you're running this through bridge_server.py, not opening the file directly.</span>";
+  }
+  render(structuredClone(DEFAULT_CONFIG));
+}
+
+// ==========================
+// LOAD CONFIG FROM FILE
+// ==========================
+
+function loadConfigFromFile(file) {
+  const reader = new FileReader();
+
+  reader.onload = function(event) {
+    try {
+      const cfg = JSON.parse(event.target.result);
+
+      if (!cfg || typeof cfg !== "object") {
+        throw new Error("Invalid JSON structure.");
+      }
+
+      // Merge safely with defaults (so missing fields don't break UI)
+      const merged = structuredClone(DEFAULT_CONFIG);
+
+      if (cfg.model_paths)
+        merged.model_paths = { ...merged.model_paths, ...cfg.model_paths };
+
+      if (cfg.translations_mm)
+        merged.translations_mm = { ...merged.translations_mm, ...cfg.translations_mm };
+       
+      if (cfg.joint_axes)
+        merged.joint_axes = { ...merged.joint_axes, ...cfg.joint_axes };
+
+      if (cfg.joint_type)
+        merged.joint_type = { ...merged.joint_type, ...cfg.joint_type };
+
+      if (cfg.joint_limits_deg)
+        merged.joint_limits_deg = { ...merged.joint_limits_deg, ...cfg.joint_limits_deg };
+
+      render(merged);
+
+      document.getElementById("status").innerHTML =
+        "<span class='ok'>Config loaded successfully ✔</span>";
+
+    } catch (err) {
+      document.getElementById("status").innerHTML =
+        "<span class='err'>Error loading file: " + err.message + "</span>";
+    }
+  };
+
+  reader.readAsText(file);
+}
+
+document.getElementById("loadBtn").addEventListener("click", () => {
+  const fileInput = document.getElementById("loadConfigFile");
+
+  if (!fileInput.files || !fileInput.files[0]) {
+    document.getElementById("status").innerHTML =
+      "<span class='err'>Please select a JSON file first.</span>";
+    return;
+  }
+
+  loadConfigFromFile(fileInput.files[0]);
+});
+
+loadDefaultConfig();
+
+</script>
+</body>
+</html>
