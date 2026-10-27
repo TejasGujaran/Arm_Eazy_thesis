@@ -223,7 +223,10 @@ def _jacobian(q, translations, axes, joint_type, joint_scale):
         base = translations[name]
         val  = float(q[i - 1])
 
-        origins.append(M[:3, 3].copy())
+        # The joint rotates about its own origin, i.e. AFTER its base offset
+        # (_fk does M @ T(base) @ R). Using M's origin here (before the
+        # offset) made the analytic Jacobian wrong by up to ~290 mm/rad.
+        origins.append((M @ _T(*base))[:3, 3].copy())
         world_axes.append(M[:3, :3] @ np.array(axis, dtype=float))
         types.append(joint_type[jkey])
         scales.append(joint_scale[jkey])
@@ -245,6 +248,21 @@ def _jacobian(q, translations, axes, joint_type, joint_scale):
             J[:, i] = np.cross(world_axes[i], tip - origins[i])
 
     return J
+
+def _angular_jacobian(q, translations, axes, joint_type):
+    """World-frame rotation axis of each revolute joint (0 for prismatic)."""
+    Jw = np.zeros((3, 6), dtype=float)
+    M = _T(*translations["BaseTransform"])
+    for i, name in enumerate(CHAIN[1:], start=1):
+        jkey = f"j{i}"
+        axis = np.array(axes[name], dtype=float)
+        n = np.linalg.norm(axis)
+        if joint_type[jkey] != "translate" and n > 0:
+            Jw[:, i - 1] = M[:3, :3] @ (axis / n)
+            M = M @ _T(*translations[name]) @ _R(*axes[name], float(q[i - 1]))
+        else:
+            M = M @ _T(*translations[name])  # rotation unchanged by translation
+    return Jw
 
 # ---------------------------------------------------------------------------
 # Main solver
@@ -275,6 +293,12 @@ def solve_ik(joint_angles, config, target_xyz, target_rpy=None):
             q0[i]    = _deg2rad(raw)
             q_min[i] = _deg2rad(lo)
             q_max[i] = _deg2rad(hi)
+
+    # least_squares refuses a seed outside the bounds. Rounded SET_JOINTS
+    # values (4 dp) or a slider at its end stop can land a hair past a
+    # limit, so nudge the seed just inside.
+    span = q_max - q_min
+    q0 = np.clip(q0, q_min + 1e-9 * span, q_max - 1e-9 * span)
 
     # Orientation targets (world frame)
     w_orient = 1000.0
@@ -309,6 +333,29 @@ def solve_ik(joint_angles, config, target_xyz, target_rpy=None):
         n_orient = len(rpy_targets)
         J_full   = np.zeros((3 + n_orient + 6, 6), dtype=float)
         J_full[:3, :] = _jacobian(q, translations, axes, joint_type, joint_scale)
+        if n_orient == 3:
+            # Analytic: d(rpy)/dq = E(rpy)^-1 * w, with w the joint's world
+            # rotation axis (0 for prismatic joints). Replaces 7 extra FK
+            # evaluations per Jacobian with one cheap matrix product.
+            M_full = _fk(q, translations, axes, joint_type, joint_scale)
+            r, p_, _y = _rpy_from_matrix(M_full[:3, :3])
+            Jw = _angular_jacobian(q, translations, axes, joint_type)
+            cp = np.cos(p_)
+            if abs(cp) > 1e-3:
+                sr, cr, tp = np.sin(r), np.cos(r), np.tan(p_)
+                cy, sy = np.cos(_y), np.sin(_y)
+                # ZYX Euler rates from world angular velocity
+                Einv = np.array([
+                    [cy / cp,       sy / cp,       0.0],
+                    [-sy,           cy,            0.0],
+                    [cy * tp,       sy * tp,       1.0],
+                ])
+                order = {"roll": 0, "pitch": 1, "yaw": 2}
+                D = Einv @ Jw
+                for row, (role, _t, w) in enumerate(rpy_targets):
+                    J_full[3 + row, :] = w * D[order[role], :]
+                J_full[3+n_orient:, :] = np.sqrt(w_reg) * np.eye(6)
+                return J_full
         if use_orientation:
             eps, r0 = 1e-6, residual(q)
             for j in range(6):
@@ -361,15 +408,28 @@ def solve_ik(joint_angles, config, target_xyz, target_rpy=None):
     err      = achieved - target
     roll, pitch, yaw = _rpy_from_matrix(M_sol[:3, :3])
 
+    # least_squares' own .success only means "a stopping criterion was met"
+    # — it is True even for unreachable targets. Report whether the target
+    # was actually reached instead.
+    POS_TOL_MM, ORI_TOL_DEG = 0.5, 0.5
+    err_norm = float(np.linalg.norm(err))
+    reached  = err_norm <= POS_TOL_MM
+    if use_orientation:
+        ach = {"roll": roll, "pitch": pitch, "yaw": yaw}
+        for role, tgt, _w in rpy_targets:
+            d = (ach[role] - tgt + np.pi) % (2 * np.pi) - np.pi
+            if abs(_rad2deg(d)) > ORI_TOL_DEG:
+                reached = False
+
     joints_out = {}
     for i, k in enumerate(JOINT_KEYS):
         joints_out[k] = float(q_sol[i]) if joint_type[k] == "translate" else _rad2deg(q_sol[i])
 
     return {
-        "success":     bool(res.success),
+        "success":     bool(reached),
         "joints":      joints_out,
         "achieved":    {"x": float(achieved[0]), "y": float(achieved[1]), "z": float(achieved[2])},
         "achievedRPY": {"roll": _rad2deg(roll), "pitch": _rad2deg(pitch), "yaw": _rad2deg(yaw)},
-        "errNorm":     float(np.linalg.norm(err)),
+        "errNorm":     err_norm,
         "message":     str(res.message),
     }
